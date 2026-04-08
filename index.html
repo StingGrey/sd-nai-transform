@@ -1141,12 +1141,17 @@ function updateStats() {
   document.getElementById('outLines').textContent = sd ? sd.split('\n').length : 0;
 }
 
+function detectInputFormat(text) {
+  if (/\d+(\.\d+)?::/.test(text)) return 'nai-v4';
+  if (/[{}]/.test(text)) return 'nai-classic';
+  return 'sd';
+}
+
 function doConvert() {
-  const useCN  = document.getElementById('cnBracket').checked;
-  const naiEl  = document.getElementById('naiInput');
-  const sdEl   = document.getElementById('sdInput');
-  const srcEl  = direction === 'n2s' ? naiEl : sdEl;
-  const dstEl  = direction === 'n2s' ? sdEl  : naiEl;
+  const useCN = document.getElementById('cnBracket').checked;
+  const naiEl = document.getElementById('naiInput');
+  const sdEl  = document.getElementById('sdInput');
+  const srcEl = direction === 'n2s' ? naiEl : sdEl;
 
   if (!srcEl.value.trim()) {
     showToast('请先输入 Prompt', 'error');
@@ -1161,16 +1166,25 @@ function doConvert() {
   setTimeout(() => {
     try {
       let inp = srcEl.value;
-      let result = '';
-
       const useBracket = sdFormat === 'bracket';
-      if (direction === 'n2s') {
+
+      // Auto-detect source format — if {} or weight:: found, treat as NAI regardless of box
+      const fmt = detectInputFormat(inp);
+      const srcIsNAI = fmt === 'nai-classic' || fmt === 'nai-v4';
+
+      let result, dstEl;
+
+      if (srcIsNAI) {
         // NAI → SD
-        result = naiFormat === 'v4' ? naiV4ToSD(inp, useBracket) : mnConvert(inp, useBracket);
+        result = fmt === 'nai-v4' ? naiV4ToSD(inp, useBracket) : mnConvert(inp, useBracket);
+        dstEl = sdEl;
+        if (srcEl !== naiEl) naiEl.value = inp; // show source in correct box
       } else {
         // SD → NAI
-        if (useCN) inp = n2mConvert(inp); // Chinese brackets first
+        if (useCN) inp = n2mConvert(inp);
         result = naiFormat === 'v4' ? sdToNaiV4(inp) : nmConvert(inp);
+        dstEl = naiEl;
+        if (srcEl !== sdEl) sdEl.value = srcEl.value;
       }
 
       dstEl.value = result;
