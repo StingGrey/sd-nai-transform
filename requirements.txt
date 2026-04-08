@@ -1,5 +1,0 @@
-pyTelegramBotAPI
-rtoml
-pathlib
-rich
-aiohttp
