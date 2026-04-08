@@ -570,7 +570,8 @@
   <header class="header">
     <div class="header-badge">✦ AI Prompt Tools</div>
     <h1>SD ↔ NAI<br>Prompt Converter</h1>
-    <p>在 NovelAI <code style="font-size:13px;background:rgba(255,255,255,0.06);padding:2px 6px;border-radius:4px;color:var(--accent3)">{{{}}}</code>
+    <p>在 NovelAI <code style="font-size:13px;background:rgba(255,255,255,0.06);padding:2px 6px;border-radius:4px;color:var(--accent3)">{{{}}}</code> /
+      <code style="font-size:13px;background:rgba(255,255,255,0.06);padding:2px 6px;border-radius:4px;color:var(--accent2)">1.5::text::</code>
       与 Stable Diffusion <code style="font-size:13px;background:rgba(255,255,255,0.06);padding:2px 6px;border-radius:4px;color:var(--accent3)">(text:weight)</code> 格式之间自由转换</p>
   </header>
 
@@ -585,6 +586,12 @@
       </button>
       <button class="tab-btn" data-mode="nm" onclick="switchMode(this)">
         <span class="tab-icon">✦</span>SD → NAI
+      </button>
+      <button class="tab-btn" data-mode="sd2v4" onclick="switchMode(this)">
+        <span class="tab-icon">✦</span>SD → NAI v4
+      </button>
+      <button class="tab-btn" data-mode="v42sd" onclick="switchMode(this)">
+        <span class="tab-icon">✦</span>NAI v4 → SD
       </button>
       <button class="tab-btn" data-mode="n2m" onclick="switchMode(this)">
         <span class="tab-icon">✦</span>中文（）→ NAI
@@ -647,8 +654,24 @@
         <div class="tip-icon">🅢</div>
         <div class="tip-text">
           <strong>SD → NAI</strong><br>
-          将 <span class="tip-code">(text:1.16)</span> 转回 <span class="tip-code">{{{text}}}</span>，
-          数值权重自动换算为括号嵌套深度
+          将 <span class="tip-code">(text:1.16)</span> / <span class="tip-code">[text]</span> 转回 <span class="tip-code">{{{text}}}</span>，
+          支持显式权重与嵌套括号
+        </div>
+      </div>
+      <div class="tip-item">
+        <div class="tip-icon">⚡</div>
+        <div class="tip-text">
+          <strong>SD → NAI v4</strong><br>
+          将 <span class="tip-code">(text:1.5)</span> 转为 NAI v4 格式 <span class="tip-code">1.5::text::</span>，
+          空格自动转下划线，支持 <span class="tip-code">[text]</span> 负权重
+        </div>
+      </div>
+      <div class="tip-item">
+        <div class="tip-icon">↩️</div>
+        <div class="tip-text">
+          <strong>NAI v4 → SD</strong><br>
+          将 <span class="tip-code">1.5::text::</span> 转回 <span class="tip-code">(text:1.5)</span>，
+          下划线自动还原为空格
         </div>
       </div>
       <div class="tip-item">
@@ -681,172 +704,288 @@
 
 <script>
 /* =====================================================
-   CONVERTER LOGIC — ported from utils/Converter.py
+   CONVERTER LOGIC v2
+   — improved with NAI v4 support, better tokenizer,
+     [] negative weight, escaped bracket handling
    ===================================================== */
 
-function crateNumText(txt, num) {
-  return txt.repeat(Math.max(0, Math.round(num)));
+// ===== CONSTANTS =====
+const NAI_BRACKET_RATIO = 1.05;  // each {} layer = ×1.05
+const SD_ROUND_MULT     = 1.1;   // () without explicit weight = ×1.1
+const SD_SQUARE_MULT    = 1 / 1.1; // [] = ×(1/1.1) ≈ 0.909
+
+function repeat(s, n) {
+  return s.repeat(Math.max(0, Math.round(n)));
 }
 
-/**
- * Tokenize text by bracket boundaries.
- * Port of Create.split_words()
- */
-function splitWords(text) {
-  const deText = [];
-  let item = [];
-  text = text.trim();
-  let over = false;
-  for (let k = 0; k < text.length; k++) {
-    const ch = text[k];
-    item.push(ch);
-    if (ch === ')' || ch === '}' || ch === ',') {
-      if (k + 1 < text.length) {
-        const next = text[k + 1];
-        if (next === ')' || next === '}' || next === ':' || /\d/.test(next)) {
-          over = false;
-        } else {
-          over = true;
+function fmtWeight(w) {
+  // Round to 2 decimal places, remove trailing zeros
+  return parseFloat(w.toFixed(2));
+}
+
+// ===== TOKENIZER =====
+// Split prompt by top-level commas, respecting bracket nesting & escaped chars
+
+function splitByComma(text) {
+  text = text.replace(/，/g, ',').trim();
+  const result = [];
+  let depth = 0;
+  let current = '';
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === '\\' && i + 1 < text.length) {
+      current += ch + text[i + 1];
+      i += 2;
+      continue;
+    }
+    if ('([{'.includes(ch)) depth++;
+    if (')]}'.includes(ch)) depth = Math.max(0, depth - 1);
+    if (ch === ',' && depth === 0) {
+      const t = current.trim();
+      if (t) result.push(t);
+      current = '';
+    } else {
+      current += ch;
+    }
+    i++;
+  }
+  const t = current.trim();
+  if (t) result.push(t);
+  return result;
+}
+
+// ===== SD ATTENTION PARSER =====
+// Parse SD-style tokens: (text:w), (text), [text], nested brackets, escaped chars
+// Returns [{text, weight}]
+
+function parseSDAttention(text) {
+  const result = [];
+  const stack = []; // {type: 'round'|'square'}
+
+  function getStackWeight() {
+    return stack.reduce((w, s) => w * (s.type === 'round' ? SD_ROUND_MULT : SD_SQUARE_MULT), 1.0);
+  }
+
+  let i = 0;
+  let buf = '';
+
+  function flush(overrideWeight) {
+    const t = buf.replace(/\s+/g, ' ').trim();
+    buf = '';
+    if (!t) return;
+    const w = overrideWeight !== undefined ? overrideWeight : getStackWeight();
+    result.push({ text: t, weight: w });
+  }
+
+  while (i < text.length) {
+    // Escaped bracket: preserve literal char
+    if (text[i] === '\\' && i + 1 < text.length && '()[]'.includes(text[i + 1])) {
+      buf += text[i + 1];
+      i += 2;
+      continue;
+    }
+
+    if (text[i] === '(') {
+      stack.push({ type: 'round' });
+      i++;
+    } else if (text[i] === '[') {
+      stack.push({ type: 'square' });
+      i++;
+    } else if (text[i] === ')' && stack.length > 0 && stack[stack.length - 1].type === 'round') {
+      flush();
+      stack.pop();
+      i++;
+    } else if (text[i] === ']' && stack.length > 0 && stack[stack.length - 1].type === 'square') {
+      flush();
+      stack.pop();
+      i++;
+    } else if (text[i] === ':' && stack.length > 0 && stack[stack.length - 1].type === 'round') {
+      // Peek: is this (text:1.23)?
+      let j = i + 1;
+      let numStr = '';
+      if (text[j] === '-') { numStr += '-'; j++; }
+      while (j < text.length && /[\d.]/.test(text[j])) { numStr += text[j++]; }
+      if (numStr && j < text.length && text[j] === ')') {
+        const w = parseFloat(numStr);
+        if (!isNaN(w) && w > 0) {
+          // Compute parent weight (all stack layers except current round)
+          const parentW = stack.slice(0, -1).reduce(
+            (acc, s) => acc * (s.type === 'round' ? SD_ROUND_MULT : SD_SQUARE_MULT), 1.0
+          );
+          flush(parentW * w);
+          stack.pop();
+          i = j + 1; // skip past ')'
+          continue;
         }
       }
-    }
-    if (k + 1 === text.length) over = true;
-    if (over) {
-      deText.push(item.join('').replace(/,/g, ''));
-      item = [];
-      over = false;
+      buf += text[i];
+      i++;
+    } else {
+      buf += text[i];
+      i++;
     }
   }
-  return deText;
+
+  // Flush remaining (unclosed brackets still apply weight)
+  flush();
+  return result;
 }
 
-/**
- * Remove target bracket chars, preserving escaped \( \)
- * Port of Create.del_smb()
- */
-function delSmb(text, target) {
-  text = text.replace(/\\\(/g, '酢').replace(/\\\)/g, '铕');
-  let result = '';
-  for (const ch of text) {
-    if (!target.includes(ch)) result += ch;
+// ===== NAI OLD {} PARSER =====
+// Returns {text, weight} where weight is layer-based (1.05^n)
+function parseNAIBrackets(text) {
+  const result = [];
+  const stack = []; // {type: 'curly'|'square'}
+
+  function getStackWeight() {
+    return stack.reduce((w, s) => w * (s.type === 'curly' ? NAI_BRACKET_RATIO : 1 / NAI_BRACKET_RATIO), 1.0);
   }
-  text = result;
-  text = text.replace(/酢/g, '\\(').replace(/铕/g, '\\)');
-  return text;
+
+  let i = 0;
+  let buf = '';
+
+  function flush() {
+    const t = buf.trim();
+    buf = '';
+    if (!t) return;
+    result.push({ text: t, weight: getStackWeight() });
+  }
+
+  while (i < text.length) {
+    if (text[i] === '{') {
+      stack.push({ type: 'curly' });
+      i++;
+    } else if (text[i] === '[') {
+      stack.push({ type: 'square' });
+      i++;
+    } else if (text[i] === '}' && stack.length > 0 && stack[stack.length - 1].type === 'curly') {
+      flush();
+      stack.pop();
+      i++;
+    } else if (text[i] === ']' && stack.length > 0 && stack[stack.length - 1].type === 'square') {
+      flush();
+      stack.pop();
+      i++;
+    } else {
+      buf += text[i];
+      i++;
+    }
+  }
+  flush();
+  return result;
 }
 
-const TARGET = '{}()';
+// ===== FORMAT OUTPUT =====
+function formatOutput(items) {
+  if (!items.length) return '';
+  const rows = [];
+  for (let i = 0; i < items.length; i += 5) {
+    rows.push(items.slice(i, i + 5).join(', '));
+  }
+  return rows.join(',\n');
+}
 
-/** NAI {} → SD (text:weight) */
+// ===== CONVERTERS =====
+
+/** NAI old {} / [] → SD (text:weight) */
 function mnConvert(txt) {
-  txt = txt.replace(/，/g, ',');
-  const list = splitWords(txt);
-  const dealAfter = [];
-  for (let item of list) {
-    item = item.trim();
-    if (item.length >= 2) {
-      const start = item[0];
-      const end = item[item.length - 1];
-      if (TARGET.includes(start) && TARGET.includes(end)) {
-        const depth = (item.match(/\{/g) || []).length;
-        const weight = Math.round(Math.pow(1.05, depth) * 100) / 100;
-        item = delSmb(item, TARGET);
-        item = `(${item}:${weight})`;
+  const items = splitByComma(txt);
+  const out = [];
+  for (const item of items) {
+    if (!item) continue;
+    // Check if it has brackets
+    if (/^[\[{]/.test(item) || /[\]}]$/.test(item)) {
+      const tokens = parseNAIBrackets(item);
+      for (const { text, weight } of tokens) {
+        if (!text) continue;
+        if (Math.abs(weight - 1.0) < 0.001) {
+          out.push(text);
+        } else {
+          out.push(`(${text}:${fmtWeight(weight)})`);
+        }
       }
+    } else {
+      out.push(item);
     }
-    dealAfter.push(item);
   }
-  let result = '';
-  for (let i = 0; i < dealAfter.length; i += 5) {
-    result += dealAfter.slice(i, i + 5).join(',') + '\n';
-  }
-  return result.trimEnd();
+  return formatOutput(out);
 }
 
-/** SD (text:weight) → NAI {} */
+/** SD (text:weight) / (text) / [text] → NAI old {} */
 function nmConvert(txt) {
-  txt = txt.replace(/，/g, ',');
-  const list = splitWords(txt);
-  const dealAfter = [];
-  for (let item of list) {
-    item = item.trim();
-    let weights = 0;
-    if (item.length >= 2) {
-      const start = item[0];
-      const end = item[item.length - 1];
-      if (item.includes(':')) {
-        const parts = item.split(':');
-        const weightPre = parts[parts.length - 1];
-        const weightStr = weightPre.replace(/[^0-9.]/g, '');
-        item = item.replace(weightStr, '').replace(':', '');
-        if (weightStr) {
-          const w = parseFloat(weightStr.trim());
-          if (!isNaN(w) && w > 0) {
-            weights = Math.round(Math.log(w) / Math.log(1.05));
-          }
-        }
-      } else {
-        if (TARGET.includes(start) && TARGET.includes(end)) {
-          const depth = (item.match(/\(/g) || []).length;
-          weights = Math.round(Math.log(Math.pow(1.1, depth)) / Math.log(1.05));
-        }
-      }
-      item = delSmb(item, TARGET);
-      if (weights > 0) {
-        item = crateNumText('{', weights) + item + crateNumText('}', weights);
-      } else if (weights < 0) {
-        item = crateNumText('[', -weights) + item + crateNumText(']', -weights);
-      }
-      dealAfter.push(item);
+  const items = splitByComma(txt);
+  const out = [];
+  for (const item of items) {
+    if (!item) continue;
+    const tokens = parseSDAttention(item);
+    for (const { text, weight } of tokens) {
+      if (!text) continue;
+      const n = Math.round(Math.log(weight) / Math.log(NAI_BRACKET_RATIO));
+      if (n > 0)      out.push(repeat('{', n) + text + repeat('}', n));
+      else if (n < 0) out.push(repeat('[', -n) + text + repeat(']', -n));
+      else            out.push(text);
     }
   }
-  let result = '';
-  for (let i = 0; i < dealAfter.length; i += 5) {
-    result += dealAfter.slice(i, i + 5).join(',') + ',\n';
-  }
-  return result.trimEnd();
+  return formatOutput(out);
 }
 
-/** Chinese （）→ NAI {} */
+/** SD (text:weight) / (text) / [text] → NAI v4 (weight::text::) */
+function sdToNaiV4(txt) {
+  const items = splitByComma(txt);
+  const out = [];
+  for (const item of items) {
+    if (!item) continue;
+    const tokens = parseSDAttention(item);
+    for (const { text, weight } of tokens) {
+      if (!text) continue;
+      const naiText = text.replace(/ /g, '_');
+      if (Math.abs(weight - 1.0) < 0.001) {
+        out.push(naiText);
+      } else {
+        out.push(`${fmtWeight(weight)}::${naiText}::`);
+      }
+    }
+  }
+  return formatOutput(out);
+}
+
+/** NAI v4 (weight::text::) → SD (text:weight) */
+function naiV4ToSD(txt) {
+  const items = splitByComma(txt);
+  const out = [];
+  for (const item of items) {
+    if (!item) continue;
+    // Match: weight::text:: or weight::text (optional trailing ::)
+    const m = item.match(/^(-?[\d.]+)::([\s\S]+?)(?:::)?$/);
+    if (m) {
+      const weight = parseFloat(m[1]);
+      const text = m[2].replace(/_/g, ' ');
+      out.push(`(${text}:${fmtWeight(weight)})`);
+    } else {
+      // Plain text: strip trailing :: if any
+      out.push(item.replace(/::$/, '').replace(/_/g, ' '));
+    }
+  }
+  return formatOutput(out);
+}
+
+/** Chinese （）→ NAI old {} */
 function n2mConvert(txt) {
   txt = txt.replace(/（/g, '(').replace(/）/g, ')');
-  const list = splitWords(txt);
-  const dealAfter = [];
-  for (let item of list) {
-    item = item.trim();
-    let weights = 0;
-    if (item.length >= 2) {
-      const start = item[0];
-      const end = item[item.length - 1];
-      if (item.includes(':')) {
-        const parts = item.split(':');
-        const weightPre = parts[parts.length - 1];
-        const weightStr = weightPre.replace(/[^0-9.]/g, '');
-        item = item.replace(weightStr, '').replace(':', '');
-        if (weightStr) {
-          const w = parseFloat(weightStr.trim());
-          if (!isNaN(w) && w > 0) {
-            weights = Math.round(Math.log(w) / Math.log(1.05));
-          }
-        }
-      } else {
-        if (TARGET.includes(start) && TARGET.includes(end)) {
-          const depth = (item.match(/\(/g) || []).length;
-          weights = Math.round(Math.log(Math.pow(1.1, depth)) / Math.log(1.05));
-        }
-      }
-      item = delSmb(item, TARGET);
-      if (weights > 0) {
-        item = crateNumText('{', weights) + item + crateNumText('}', weights);
-      }
-      dealAfter.push(item);
+  const items = splitByComma(txt);
+  const out = [];
+  for (const item of items) {
+    if (!item) continue;
+    const tokens = parseSDAttention(item);
+    for (const { text, weight } of tokens) {
+      if (!text) continue;
+      const n = Math.round(Math.log(weight) / Math.log(NAI_BRACKET_RATIO));
+      if (n > 0) out.push(repeat('{', n) + text + repeat('}', n));
+      else       out.push(text);
     }
   }
-  let result = '';
-  for (let i = 0; i < dealAfter.length; i += 5) {
-    result += dealAfter.slice(i, i + 5).join(',') + '\n';
-  }
-  return result.trimEnd();
+  return formatOutput(out);
 }
 
 /* =====================================================
@@ -870,11 +1009,13 @@ function switchMode(btn) {
   // Update placeholder
   const inp = document.getElementById('input');
   const placeholders = {
-    mn:  '在此输入 NAI 格式 Prompt…\n\n例: {{{blue eyes}}},{{silver hair}},\n{beautiful face}',
-    nm:  '在此输入 SD 格式 Prompt…\n\n例: (blue eyes:1.16),(silver hair:1.1),\n(beautiful face:1.05)',
-    n2m: '在此输入含中文括号的 Prompt…\n\n例: （blue eyes）,（silver hair）'
+    mn:    '在此输入 NAI 格式 Prompt…\n\n例: {{{blue eyes}}},{{silver hair}},\n[ugly]',
+    nm:    '在此输入 SD 格式 Prompt…\n\n例: (blue eyes:1.16),(silver hair:1.1),\n[ugly:0.9],(beautiful face)',
+    sd2v4: '在此输入 SD 格式 Prompt…\n\n例: (long hair:1.3),(smile),(blue eyes:0.8),\n[ugly]',
+    v42sd: '在此输入 NAI v4 格式 Prompt…\n\n例: 1.3::long_hair::, smile, 0.8::blue_eyes::',
+    n2m:   '在此输入含中文括号的 Prompt…\n\n例: （blue eyes）,（silver hair）'
   };
-  inp.placeholder = placeholders[currentMode];
+  inp.placeholder = placeholders[currentMode] || '';
 
   // Auto-convert if there's content
   if (inp.value.trim()) doConvert();
@@ -925,9 +1066,11 @@ function doConvert() {
   setTimeout(() => {
     try {
       let result = '';
-      if      (currentMode === 'mn')  result = mnConvert(inp);
-      else if (currentMode === 'nm')  result = nmConvert(inp);
-      else if (currentMode === 'n2m') result = n2mConvert(inp);
+      if      (currentMode === 'mn')    result = mnConvert(inp);
+      else if (currentMode === 'nm')    result = nmConvert(inp);
+      else if (currentMode === 'sd2v4') result = sdToNaiV4(inp);
+      else if (currentMode === 'v42sd') result = naiV4ToSD(inp);
+      else if (currentMode === 'n2m')   result = n2mConvert(inp);
 
       const out = document.getElementById('output');
       out.value = result;
