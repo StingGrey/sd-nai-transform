@@ -966,6 +966,14 @@ function formatOutput(items) {
 
 // ===== CONVERTERS =====
 
+/** Convert weight to bracket notation. logBase determines bracket depth. */
+function weightToBrackets(weight, text, open, close, logBase) {
+  const n = Math.round(Math.log(weight) / Math.log(logBase));
+  if (n > 0)      return repeat(open, n) + text + repeat(close, n);
+  else if (n < 0) return repeat(close, -n) + text + repeat(open, -n);
+  return text;
+}
+
 /** NAI old {} / [] → SD, respecting sdFormat ('num' or 'bracket') */
 function mnConvert(txt, useBracket) {
   const items = splitByComma(txt);
@@ -976,17 +984,9 @@ function mnConvert(txt, useBracket) {
       const tokens = parseNAIBrackets(item);
       for (const { text, weight } of tokens) {
         if (!text) continue;
-        if (Math.abs(weight - 1.0) < 0.001) {
-          out.push(text);
-        } else if (useBracket) {
-          // Convert weight to SD bracket nesting (base 1.1 per layer)
-          const n = Math.round(Math.log(weight) / Math.log(SD_ROUND_MULT));
-          if (n > 0)      out.push(repeat('(', n) + text + repeat(')', n));
-          else if (n < 0) out.push(repeat('[', -n) + text + repeat(']', -n));
-          else            out.push(text);
-        } else {
-          out.push(`(${text}:${fmtWeight(weight)})`);
-        }
+        if (Math.abs(weight - 1.0) < 0.001) out.push(text);
+        else if (useBracket) out.push(weightToBrackets(weight, text, '(', ')', SD_ROUND_MULT));
+        else out.push(`(${text}:${fmtWeight(weight)})`);
       }
     } else {
       out.push(item);
@@ -1004,10 +1004,7 @@ function nmConvert(txt) {
     const tokens = parseSDAttention(item);
     for (const { text, weight } of tokens) {
       if (!text) continue;
-      const n = Math.round(Math.log(weight) / Math.log(NAI_BRACKET_RATIO));
-      if (n > 0)      out.push(repeat('{', n) + text + repeat('}', n));
-      else if (n < 0) out.push(repeat('[', -n) + text + repeat(']', -n));
-      else            out.push(text);
+      out.push(weightToBrackets(weight, text, '{', '}', NAI_BRACKET_RATIO));
     }
   }
   return formatOutput(out);
@@ -1044,10 +1041,7 @@ function naiV4ToSD(txt, useBracket) {
       const weight = parseFloat(m[1]);
       const text = m[2].replace(/_/g, ' ');
       if (useBracket) {
-        const n = Math.round(Math.log(weight) / Math.log(SD_ROUND_MULT));
-        if (n > 0)      out.push(repeat('(', n) + text + repeat(')', n));
-        else if (n < 0) out.push(repeat('[', -n) + text + repeat(']', -n));
-        else            out.push(text);
+        out.push(weightToBrackets(weight, text, '(', ')', SD_ROUND_MULT));
       } else {
         out.push(`(${text}:${fmtWeight(weight)})`);
       }
@@ -1089,10 +1083,7 @@ function naiV4ToClassic(txt) {
     if (m) {
       const weight = parseFloat(m[1]);
       const text = m[2].replace(/_/g, ' ');
-      const n = Math.round(Math.log(weight) / Math.log(NAI_BRACKET_RATIO));
-      if (n > 0)      out.push(repeat('{', n) + text + repeat('}', n));
-      else if (n < 0) out.push(repeat('[', -n) + text + repeat(']', -n));
-      else            out.push(text);
+      out.push(weightToBrackets(weight, text, '{', '}', NAI_BRACKET_RATIO));
     } else {
       out.push(item.replace(/::$/, '').replace(/_/g, ' '));
     }
@@ -1196,7 +1187,7 @@ function updateStats() {
 }
 
 function detectInputFormat(text) {
-  if (/\d+(\.\d+)?::/.test(text)) return 'nai-v4';
+  if (/(?:^|,\s*)-?\d+(?:\.\d+)?::/.test(text)) return 'nai-v4';
   if (/[{}]/.test(text)) return 'nai-classic';
   return 'sd';
 }
