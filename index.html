@@ -682,6 +682,14 @@
         </label>
         <span class="opt-hint">（）→ ()</span>
       </div>
+      <div class="opt-group">
+        <span class="opt-label">保留空格</span>
+        <label class="toggle-switch">
+          <input type="checkbox" id="keepSpace">
+          <span class="toggle-track"></span>
+        </label>
+        <span class="opt-hint">不转 _</span>
+      </div>
     </div>
 
     <!-- Editor -->
@@ -749,7 +757,7 @@
         <div class="tip-text">
           <strong>NAI v4 格式</strong><br>
           点击「经典 / v4」切换：<span class="tip-code">1.5::text::</span> ↔ <span class="tip-code">(text:1.5)</span>，
-          空格与下划线自动互转
+          默认空格与下划线自动互转，开启「保留空格」可关闭此行为
         </div>
       </div>
       <div class="tip-item">
@@ -1011,7 +1019,7 @@ function nmConvert(txt) {
 }
 
 /** SD (text:weight) / (text) / [text] → NAI v4 (weight::text::) */
-function sdToNaiV4(txt) {
+function sdToNaiV4(txt, keepSpace) {
   const items = splitByComma(txt);
   const out = [];
   for (const item of items) {
@@ -1019,7 +1027,7 @@ function sdToNaiV4(txt) {
     const tokens = parseSDAttention(item);
     for (const { text, weight } of tokens) {
       if (!text) continue;
-      const naiText = text.replace(/ /g, '_');
+      const naiText = keepSpace ? text : text.replace(/ /g, '_');
       if (Math.abs(weight - 1.0) < 0.001) {
         out.push(naiText);
       } else {
@@ -1053,7 +1061,7 @@ function naiV4ToSD(txt, useBracket) {
 }
 
 /** NAI classic {} → NAI v4 weight:: */
-function naiClassicToV4(txt) {
+function naiClassicToV4(txt, keepSpace) {
   const items = splitByComma(txt);
   const out = [];
   for (const item of items) {
@@ -1062,7 +1070,7 @@ function naiClassicToV4(txt) {
       const tokens = parseNAIBrackets(item);
       for (const { text, weight } of tokens) {
         if (!text) continue;
-        const t = text.replace(/ /g, '_');
+        const t = keepSpace ? text : text.replace(/ /g, '_');
         if (Math.abs(weight - 1.0) < 0.001) out.push(t);
         else out.push(`${fmtWeight(weight)}::${t}::`);
       }
@@ -1156,7 +1164,8 @@ function toggleFmt() {
   if (content) {
     const fmt = detectInputFormat(content);
     if (naiFormat === 'v4' && fmt === 'nai-classic') {
-      naiEl.value = naiClassicToV4(content);
+      const keepSpace = document.getElementById('keepSpace').checked;
+      naiEl.value = naiClassicToV4(content, keepSpace);
       updateStats();
       showToast('已转换为 NAI v4 格式', 'info');
     } else if (naiFormat === 'classic' && fmt === 'nai-v4') {
@@ -1194,6 +1203,7 @@ function detectInputFormat(text) {
 
 function doConvert() {
   const useCN = document.getElementById('cnBracket').checked;
+  const keepSpace = document.getElementById('keepSpace').checked;
   const naiEl = document.getElementById('naiInput');
   const sdEl  = document.getElementById('sdInput');
   const srcEl = direction === 'n2s' ? naiEl : sdEl;
@@ -1227,7 +1237,7 @@ function doConvert() {
       } else {
         // SD → NAI
         if (useCN) inp = n2mConvert(inp);
-        result = naiFormat === 'v4' ? sdToNaiV4(inp) : nmConvert(inp);
+        result = naiFormat === 'v4' ? sdToNaiV4(inp, keepSpace) : nmConvert(inp);
         dstEl = naiEl;
         if (srcEl !== sdEl) sdEl.value = srcEl.value;
       }
